@@ -155,7 +155,9 @@ describe("MongoDBSaver", () => {
         enableTimestamps: true,
       });
 
-      const before = new Date();
+      // Subtract 1ms to avoid a race where upserted_at lands in the same
+      // millisecond as `before`, causing the >= assertion to fail flakily.
+      const before = new Date(Date.now() - 1);
 
       await saver.put({ configurable: { thread_id: "ts-1" } }, checkpoint1, {
         source: "update",

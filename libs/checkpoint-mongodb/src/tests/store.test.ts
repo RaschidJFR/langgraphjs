@@ -533,26 +533,186 @@ describe("MongoDBStore", () => {
       expect(items).toHaveLength(1);
     });
 
-    it("should throw clear error when vector search is attempted without embeddings (auto-embed mode)", async () => {
+    it("should throw when neither embeddings nor indexConfig is provided and query is given", async () => {
       const operation = {
         namespacePrefix: ["documents"],
-        query: "find something",  // Vector search requested
+        query: "find something",
         limit: 100,
         offset: 0,
       };
 
-      // Store without embeddings, which implies auto-embed mode
-      const storeWithoutEmbeddings = new MongoDBStore({
+      const bareStore = new MongoDBStore({
         client: mockClient,
         dbName: "test",
         collectionName: "store",
         enableTimestamps: false,
-        // No embeddings provided - implies MongoDB Atlas auto-embedding
+        // No embeddings, no indexConfig
       });
 
-      await expect(storeWithoutEmbeddings.batch([operation])).rejects.toThrow(
-        /auto-embed/i
+      await expect(bareStore.batch([operation])).rejects.toThrow(
+        /embeddings interface or an indexConfig/i
       );
+    });
+  });
+
+  describe("Atlas auto-embedding mode ($vectorSearch with query.text)", () => {
+    it("should use query.text in $vectorSearch when indexConfig is set but no embeddings", async () => {
+      // In Atlas auto-embedding mode, dims is not required — the model determines it
+      const storeAutoEmbed = new MongoDBStore({
+        client: mockClient,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: {
+          name: "my_vector_index",
+          path: "value.content",
+        },
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeAutoEmbed.batch([{
+        namespacePrefix: ["memories"],
+        query: "outdoor activities",
+        limit: 5,
+        offset: 0,
+      }]);
+
+      expect(capturedPipelines).toHaveLength(1);
+      expect(capturedPipelines[0][0].$vectorSearch).toEqual({
+        index: "my_vector_index",
+        path: "value.content",
+        query: { text: "outdoor activities" },
+        numCandidates: 1000,
+        limit: 5,
+        filter: { namespacePath: { $in: ["memories"] } },
+        // queryVector is absent — Atlas embeds the query server-side
+      });
+    });
+
+    it("should default path to 'embedding' in $vectorSearch when indexConfig.path is not set", async () => {
+      const storeAutoEmbed = new MongoDBStore({
+        client: mockClient,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: { name: "my_vector_index" },
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeAutoEmbed.batch([{
+        namespacePrefix: ["docs"],
+        query: "some query",
+        limit: 10,
+        offset: 0,
+      }]);
+
+      expect(capturedPipelines[0][0].$vectorSearch).toEqual({
+        index: "my_vector_index",
+        path: "embedding", // default when indexConfig.path is not set
+        query: { text: "some query" },
+        numCandidates: 1000,
+        limit: 10,
+        filter: { namespacePath: { $in: ["docs"] } },
+      });
+    });
+
+    it("should not call any embed function in auto-embed mode", async () => {
+      const storeAutoEmbed = new MongoDBStore({
+        client: mockClient,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: { name: "my_vector_index", path: "value.content" },
+      });
+
+      mockCollection.aggregate = vi.fn(() => ({
+        toArray: vi.fn().mockResolvedValue([]),
+      }));
+
+      // Should succeed without any embeddings configured
+      await expect(storeAutoEmbed.batch([{
+        namespacePrefix: ["docs"],
+        query: "some query",
+        limit: 10,
+        offset: 0,
+      }])).resolves.not.toThrow();
+    });
+
+    it("should use queryVector (not query.text) when both indexConfig and embeddings are configured", async () => {
+      const mockEmbedQuery = vi.fn().mockResolvedValue([0.1, 0.2, 0.3]);
+      const storeWithBoth = new MongoDBStore({
+        client: mockClient,
+        dbName: "test",
+        collectionName: "store",
+        // dims is still accepted when using client-side embeddings
+        indexConfig: { name: "my_vector_index", dims: 3 },
+        embeddings: {
+          embedQuery: mockEmbedQuery,
+          embedDocuments: vi.fn().mockResolvedValue([[0.1, 0.2, 0.3]]),
+        } as any,
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeWithBoth.batch([{
+        namespacePrefix: ["docs"],
+        query: "some query",
+        limit: 10,
+        offset: 0,
+      }]);
+
+      expect(capturedPipelines[0][0].$vectorSearch).toEqual({
+        index: "my_vector_index",
+        path: "embedding",
+        queryVector: [0.1, 0.2, 0.3],
+        numCandidates: 1000,
+        limit: 10,
+        filter: { namespacePath: { $in: ["docs"] } },
+        // query.text is absent — embedding was generated client-side
+      });
+      expect(mockEmbedQuery).toHaveBeenCalledWith("some query");
+    });
+
+    it("should include namespace filter in $vectorSearch when namespacePrefix is set", async () => {
+      const storeAutoEmbed = new MongoDBStore({
+        client: mockClient,
+        dbName: "test",
+        collectionName: "store",
+        indexConfig: { name: "my_vector_index" },
+      });
+
+      const capturedPipelines: any[][] = [];
+      mockCollection.aggregate = vi.fn((pipeline: any[]) => {
+        capturedPipelines.push(pipeline);
+        return { toArray: vi.fn().mockResolvedValue([]) };
+      });
+
+      await storeAutoEmbed.batch([{
+        namespacePrefix: ["memories", "user_1"],
+        query: "outdoor activities",
+        limit: 10,
+        offset: 0,
+      }]);
+
+      expect(capturedPipelines[0][0].$vectorSearch).toEqual({
+        index: "my_vector_index",
+        path: "embedding",
+        query: { text: "outdoor activities" },
+        numCandidates: 1000,
+        limit: 10,
+        filter: { namespacePath: { $in: ["memories/user_1"] } },
+      });
     });
   });
 });

@@ -653,3 +653,202 @@ describe("MongoDBStore Integration Tests", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Atlas auto-embedding integration tests
+//
+// Enable by setting TEST_MONGODB_AUTOEMBEDDING=true in your environment.
+// Requires Community Edition 8.2+. See docker-compose.yml for setup.
+// ---------------------------------------------------------------------------
+
+const AUTOEMBEDDING_URL =
+  process.env.MONGODB_URL ??
+  "mongodb://user:password@127.0.0.1:27017/?directConnection=true&authSource=admin";
+const AUTOEMBEDDING_DB = "langgraph_test";
+const AUTOEMBEDDING_COLLECTION = "test_autoembedding";
+const AUTOEMBEDDING_INDEX = "test_autoembedding_index";
+
+/**
+ * Run a search op and retry until results come back.
+ * Auto-embeddings are generated asynchronously, so the first search after
+ * inserting documents may return empty until Atlas finishes embedding them.
+ */
+async function searchWithRetry(
+  store: MongoDBStore,
+  op: SearchOperation,
+  timeoutMs = 90_000
+): Promise<any[]> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const results = (await store.batch([op]))[0] as any[];
+    if (results.length > 0) return results;
+    await new Promise((resolve) => setTimeout(resolve, 3_000));
+  }
+  throw new Error(
+    `Search returned no results within ${timeoutMs}ms — auto-embeddings may have failed`
+  );
+}
+
+describe.skipIf(!process.env.TEST_MONGODB_AUTOEMBEDDING)(
+  "Atlas auto-embedding (query.text mode)",
+  () => {
+    let store: MongoDBStore;
+    let client: MongoClient;
+
+    beforeAll(async () => {
+      client = new MongoClient(AUTOEMBEDDING_URL);
+      await client.connect();
+
+      // fromConnString calls start() which creates the vector search index
+      store = await MongoDBStore.fromConnString(AUTOEMBEDDING_URL, {
+        dbName: AUTOEMBEDDING_DB,
+        collectionName: AUTOEMBEDDING_COLLECTION,
+        indexConfig: {
+          name: AUTOEMBEDDING_INDEX,
+          path: "value.content",
+          model: "voyage-4",
+        },
+      });
+
+      // Clean slate
+      await client
+        .db(AUTOEMBEDDING_DB)
+        .collection(AUTOEMBEDDING_COLLECTION)
+        .deleteMany({});
+
+      // On a fresh container the preview image sometimes sends an invalid
+      // 'service_tier' parameter to Voyage AI on its first call.
+      const probePut = [{
+        namespace: ["__warmup__"],
+        key: "probe",
+        value: { content: "warmup probe" },
+      }] as PutOperation[];
+      const probeDelete = [{
+        namespace: ["__warmup__"],
+        key: "probe",
+        value: null,
+      }] as PutOperation[];
+      const probeSearch = {
+        namespacePrefix: ["__warmup__"],
+        query: "warmup",
+        limit: 1,
+      };
+
+      await store.batch(probePut);
+      try {
+        await searchWithRetry(store, probeSearch, 5_000);
+      } catch {
+        // Rate-limit active — discard the stuck probe, sleep out the window,
+        // then re-insert so it embeds on a fresh change-stream event.
+        await store.batch(probeDelete);
+        await new Promise((r) => setTimeout(r, 5_000));
+        await store.batch(probePut);
+        await searchWithRetry(store, probeSearch, 5_000);
+      }
+
+      // Clean up probe
+      await store.batch(probeDelete);
+
+      // Insert test memories — Atlas auto-embeds them via Voyage AI
+      const puts: PutOperation[] = [
+        {
+          namespace: ["memories", "alice"],
+          key: "mem_1",
+          value: { content: "Alice loves hiking in the mountains and camping outdoors." },
+        },
+        {
+          namespace: ["memories", "alice"],
+          key: "mem_2",
+          value: { content: "Alice is a software engineer who enjoys building developer tools." },
+        },
+        {
+          namespace: ["memories", "alice"],
+          key: "mem_3",
+          value: { content: "Alice recently adopted a golden retriever named Biscuit." },
+        },
+        {
+          namespace: ["memories", "bob"],
+          key: "mem_4",
+          value: { content: "Bob loves mountain climbing and rock climbing." },
+        },
+      ];
+      await store.batch(puts);
+    }, 120_000);
+
+    afterAll(async () => {
+      await client
+        .db(AUTOEMBEDDING_DB)
+        .collection(AUTOEMBEDDING_COLLECTION)
+        .deleteMany({});
+      await client.close();
+    });
+
+    it("should create a vectorSearch index with autoEmbed field on start()", async () => {
+      const indexes = (await client
+        .db(AUTOEMBEDDING_DB)
+        .collection(AUTOEMBEDDING_COLLECTION)
+        .listSearchIndexes(AUTOEMBEDDING_INDEX)
+        .toArray()) as any[];
+
+      expect(indexes).toHaveLength(1);
+      const def = indexes[0].latestDefinition;
+      const embedField = def.fields.find((f: any) => f.type === "autoEmbed");
+      expect(embedField).toBeDefined();
+      expect(embedField.path).toBe("value.content");
+      expect(embedField.model).toBe("voyage-4");
+    });
+
+    it("should store documents without a client-side embedding field", async () => {
+      const doc = await client
+        .db(AUTOEMBEDDING_DB)
+        .collection(AUTOEMBEDDING_COLLECTION)
+        .findOne({ key: "mem_1", namespacePath: "memories/alice" });
+
+      expect(doc).toBeDefined();
+      expect(doc!.embedding).toBeUndefined();
+      expect(doc!.value.content).toBe(
+        "Alice loves hiking in the mountains and camping outdoors."
+      );
+    });
+
+    it("should return scored results for a semantic query", async () => {
+      const results = await searchWithRetry(store, {
+        namespacePrefix: ["memories", "alice"],
+        query: "outdoor activities",
+        limit: 3,
+        offset: 0,
+      } as any);
+
+      expect(results.length).toBeGreaterThan(0);
+      expect(results[0]).toHaveProperty("score");
+      expect(typeof results[0].score).toBe("number");
+    });
+
+    it("should rank the hiking memory highest for 'outdoor activities'", async () => {
+      const results = await searchWithRetry(store, {
+        namespacePrefix: ["memories", "alice"],
+        query: "outdoor activities",
+        limit: 3,
+        offset: 0,
+      } as any);
+
+      expect(results[0].value.content).toContain("hiking");
+      for (let i = 0; i < results.length - 1; i++) {
+        expect(results[i].score).toBeGreaterThanOrEqual(results[i + 1].score);
+      }
+    });
+
+    it("should scope results to the searched namespace prefix", async () => {
+      const results = await searchWithRetry(store, {
+        namespacePrefix: ["memories", "alice"],
+        query: "outdoor activities",
+        limit: 10,
+        offset: 0,
+      } as any);
+
+      expect(
+        results.every((r: any) => r.namespace[1] === "alice")
+      ).toBe(true);
+    });
+  }
+);

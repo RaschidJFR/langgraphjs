@@ -66,16 +66,36 @@ function validateNamespace(namespace: string[]): void {
 export type IndexConfig = {
   /** Atlas vector search index name */
   name: string;
-  /** Embedding dimensionality */
-  dims: number;
-  /** Field in valueIndex to embed (default: embed full JSON of value) */
+  /**
+   * Embedding dimensionality. Required when using client-side embeddings so that
+   * the store can validate vector dimensions. Not required (and ignored) in Atlas
+   * auto-embedding mode, where the model determines dimensionality automatically.
+   */
+  dims?: number;
+  /** Sub-field of value to embed (e.g. "content"). If omitted, the entire value object is serialized and embedded. */
   embeddingKey?: string;
   /** Similarity function for Atlas vector search (default: "cosine") */
   similarityFunction?: "cosine" | "euclidean" | "dotProduct";
-  /** Field names to store in valueIndex (undefined = store all) */
-  fields?: string[];
   /** Filter fields to declare in the Atlas vector search index */
   filters?: string[];
+  /**
+   * Field path used in the Atlas $vectorSearch stage.
+   * - For client-side embeddings: defaults to "embedding" (the field written by the store).
+   * - For Atlas auto-embedding (no embeddings provided): set this to the text field
+   *   to be embedded (e.g. "value.content").
+   */
+  path?: string;
+  /**
+   * Voyage AI model to use for auto-embedding (e.g. "voyage-3", "voyage-4").
+   * Required when using Atlas auto-embedding (no embeddings provided).
+   * Ignored when using client-side embeddings.
+   */
+  model?: string;
+  /**
+   * Modality of the content to embed. Defaults to "text".
+   * Only used in Atlas auto-embedding mode.
+   */
+  modality?: string;
 };
 
 /**
@@ -238,7 +258,8 @@ export class MongoDBStore extends BaseStore {
 
       // When embeddings are NOT provided, we assume MongoDB Atlas auto-embedding is enabled.
       // Documents are stored without an embedding field, and MongoDB will generate embeddings
-      // automatically. Vector search is not supported in this mode (see searchOp for details).
+      // automatically. Semantic search is still supported via Atlas $vectorSearch with
+      // query.text (see searchOp / atlasVectorSearch for details).
       if (this.embeddings) {
         for (let i = 0; i < opsList.length; i++) {
           const { op } = opsList[i];
@@ -297,7 +318,6 @@ export class MongoDBStore extends BaseStore {
           namespace,
           key,
           value, // Store JSON directly
-          valueIndex: value,
           namespacePath: computeNamespacePath(namespace),
           updatedAt: now,
         };
@@ -463,7 +483,7 @@ export class MongoDBStore extends BaseStore {
    * Search for items by namespace prefix and filter criteria.
    * Supports both field-based filtering (structured search) and vector similarity search.
    *
-   * Field-based search (filter parameter): Always available, searches valueIndex fields.
+   * Field-based search (filter parameter): Always available, searches value fields.
    * Vector search (query parameter): Requires embeddings to be configured.
    *   - If embeddings are provided: Performs semantic search on the query
    *   - If embeddings are NOT provided: Throws an error. In this mode, MongoDB Atlas
@@ -481,13 +501,13 @@ export class MongoDBStore extends BaseStore {
 
     // If query is provided, vector search is requested
     if (query) {
-      // Vector search requires embeddings
-      if (!this.embeddings) {
+      // Vector search requires either client-side embeddings or an Atlas indexConfig
+      // (which enables Atlas auto-embedding via $vectorSearch query.text).
+      if (!this.embeddings && !this.indexConfig) {
         throw new Error(
-          "Vector search is not supported when embeddings are not configured. " +
-            "You appear to be using MongoDB Atlas auto-embedding mode. " +
-            "In auto-embed mode, semantic search (query parameter) is not available. " +
-            "Use field-based filtering (filter parameter) instead, or provide an embeddings interface to enable semantic search."
+          "Vector search requires either an embeddings interface or an indexConfig. " +
+            "Provide an embeddings interface for client-side embedding, or provide an " +
+            "indexConfig to use MongoDB Atlas auto-embedding (query.text mode)."
         );
       }
       return this.vectorSearch(query, namespacePrefix || [], limit, offset);
@@ -502,7 +522,7 @@ export class MongoDBStore extends BaseStore {
       mongoQuery.namespace = namespacePrefix;
     }
 
-    // Build filter conditions against valueIndex
+    // Build filter conditions against the stored value document
     if (filter && Object.keys(filter).length > 0) {
       for (const [field, condition] of Object.entries(filter)) {
         if (
@@ -514,28 +534,28 @@ export class MongoDBStore extends BaseStore {
           for (const [operator, operatorValue] of Object.entries(condition)) {
             switch (operator) {
               case "$eq":
-                mongoQuery[`valueIndex.${field}`] = operatorValue;
+                mongoQuery[`value.${field}`] = operatorValue;
                 break;
               case "$ne":
-                mongoQuery[`valueIndex.${field}`] = { $ne: operatorValue };
+                mongoQuery[`value.${field}`] = { $ne: operatorValue };
                 break;
               case "$gt":
-                mongoQuery[`valueIndex.${field}`] = { $gt: operatorValue };
+                mongoQuery[`value.${field}`] = { $gt: operatorValue };
                 break;
               case "$gte":
-                mongoQuery[`valueIndex.${field}`] = { $gte: operatorValue };
+                mongoQuery[`value.${field}`] = { $gte: operatorValue };
                 break;
               case "$lt":
-                mongoQuery[`valueIndex.${field}`] = { $lt: operatorValue };
+                mongoQuery[`value.${field}`] = { $lt: operatorValue };
                 break;
               case "$lte":
-                mongoQuery[`valueIndex.${field}`] = { $lte: operatorValue };
+                mongoQuery[`value.${field}`] = { $lte: operatorValue };
                 break;
             }
           }
         } else {
           // Exact match
-          mongoQuery[`valueIndex.${field}`] = condition;
+          mongoQuery[`value.${field}`] = condition;
         }
       }
     }
@@ -565,8 +585,11 @@ export class MongoDBStore extends BaseStore {
 
   /**
    * Perform vector similarity search.
-   * Requires embeddings to be configured.
-   * Uses Atlas $vectorSearch if indexConfig is set, otherwise uses in-memory cosine similarity.
+   * Uses Atlas $vectorSearch if indexConfig is set:
+   *   - With client-side embeddings (embeddings configured): passes queryVector.
+   *   - With Atlas auto-embedding (no embeddings, indexConfig set): passes query.text,
+   *     and Atlas generates the query embedding server-side via Voyage AI.
+   * Falls back to in-memory cosine similarity when only embeddings are configured.
    */
   private async vectorSearch(
     query: string,
@@ -574,13 +597,15 @@ export class MongoDBStore extends BaseStore {
     limit: number,
     offset: number
   ): Promise<SearchItem[]> {
-    // This method is only called after embeddings have been verified to exist
-    // in searchOp, so we can safely assume embeddings is configured here
-    const queryEmbedding = await this.embeddings!.embedQuery(query);
-
     // If indexConfig is set, use Atlas $vectorSearch
     if (this.indexConfig) {
+      // Generate a client-side query embedding if embeddings are configured;
+      // otherwise Atlas auto-embedding will handle it via query.text.
+      const queryEmbedding = this.embeddings
+        ? await this.embeddings.embedQuery(query)
+        : null;
       return this.atlasVectorSearch(
+        query,
         queryEmbedding,
         namespacePrefix,
         limit,
@@ -588,7 +613,8 @@ export class MongoDBStore extends BaseStore {
       );
     }
 
-    // Otherwise, use in-memory cosine similarity
+    // Otherwise, use in-memory cosine similarity (requires client-side embeddings)
+    const queryEmbedding = await this.embeddings!.embedQuery(query);
     return this.inMemoryVectorSearch(
       queryEmbedding,
       namespacePrefix,
@@ -599,9 +625,14 @@ export class MongoDBStore extends BaseStore {
 
   /**
    * Perform vector search using MongoDB Atlas $vectorSearch aggregation stage.
+   *
+   * When queryEmbedding is provided (client-side embedding mode), passes it as
+   * queryVector. When queryEmbedding is null (Atlas auto-embedding mode), passes
+   * queryText via query.text so Atlas generates the embedding server-side.
    */
   private async atlasVectorSearch(
-    queryEmbedding: number[],
+    queryText: string,
+    queryEmbedding: number[] | null,
     namespacePrefix: string[],
     limit: number,
     offset: number
@@ -614,21 +645,32 @@ export class MongoDBStore extends BaseStore {
       namespacePrefixFilter = namespacePrefix.join("/");
     }
 
+    // Resolve the field path for $vectorSearch:
+    // - client-side embeddings: stored in the "embedding" field by default
+    // - Atlas auto-embedding: the text field configured in the Atlas index definition
+    const path = this.indexConfig!.path ?? "embedding";
+
     // Stage 1: Vector search with namespace filtering
     const vectorSearchStage: Record<string, any> = {
       $vectorSearch: {
         index: this.indexConfig!.name,
-        path: "embedding",
-        queryVector: queryEmbedding,
+        path,
         numCandidates: Math.max(limit + offset, 100) * 10,
         limit: limit + offset,
       },
     };
 
-    // Add namespace filter if provided
+    // Use queryVector for client-side embeddings, or query.text for Atlas auto-embedding
+    if (queryEmbedding !== null) {
+      vectorSearchStage.$vectorSearch.queryVector = queryEmbedding;
+    } else {
+      vectorSearchStage.$vectorSearch.query = { text: queryText };
+    }
+
+    // Add namespace filter if provided ($vectorSearch filter uses MQL query syntax)
     if (namespacePrefixFilter) {
       vectorSearchStage.$vectorSearch.filter = {
-        $in: ["$namespacePath", [namespacePrefixFilter]],
+        namespacePath: { $in: [namespacePrefixFilter] },
       };
     }
 
@@ -759,18 +801,67 @@ export class MongoDBStore extends BaseStore {
   }
 
   /**
-   * Initialize the store (create indexes on {namespace, key} and optional TTL index).
+   * Initialize the store: creates the {namespace, key} unique index, an optional
+   * TTL index, and — when indexConfig is provided — the vector search index.
    */
   async start(): Promise<void> {
-    await this.db
-      .collection(this.collectionName)
-      .createIndex({ namespace: 1, key: 1 }, { unique: true });
+    const collection = this.db.collection(this.collectionName);
 
-    // Create TTL index if configured
+    await collection.createIndex({ namespace: 1, key: 1 }, { unique: true });
+
     if (this.ttl) {
-      await this.db
-        .collection(this.collectionName)
-        .createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+      await collection.createIndex(
+        { expiresAt: 1 },
+        { expireAfterSeconds: 0 }
+      );
+    }
+
+    if (this.indexConfig) {
+      const fields: Record<string, any>[] = [];
+
+      if (this.embeddings) {
+        // Client-side embedding mode: standard vector field on the embedding field
+        const vectorField: Record<string, any> = {
+          type: "vector",
+          path: this.indexConfig.path ?? "embedding",
+          similarity: this.indexConfig.similarityFunction ?? "cosine",
+        };
+        if (this.indexConfig.dims !== undefined) {
+          vectorField.numDimensions = this.indexConfig.dims;
+        }
+        fields.push(vectorField);
+      } else {
+        // Atlas auto-embedding mode: let MongoDB embed the text field via Voyage AI
+        fields.push({
+          type: "autoEmbed",
+          path: this.indexConfig.path,
+          model: this.indexConfig.model,
+          modality: this.indexConfig.modality ?? "text",
+        });
+      }
+
+      // Always index namespacePath so $vectorSearch pre-filtering is efficient
+      fields.push({ type: "filter", path: "namespacePath" });
+
+      // Any additional filter fields declared by the caller
+      for (const filterField of this.indexConfig.filters ?? []) {
+        if (filterField !== "namespacePath") {
+          fields.push({ type: "filter", path: filterField });
+        }
+      }
+
+      try {
+        await collection.createSearchIndex({
+          name: this.indexConfig.name,
+          type: "vectorSearch",
+          definition: { fields },
+        } as any);
+      } catch (err: any) {
+        // Ignore "index already exists" — treat createSearchIndex as idempotent
+        if (!err?.message?.toLowerCase().includes("already exists")) {
+          throw err;
+        }
+      }
     }
   }
 
